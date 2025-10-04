@@ -4,14 +4,16 @@
 
 import { Router } from "oak/mod.ts";
 import { config } from "./config.ts";
-import { 
+import type { 
   Message, UpstreamRequest,
-  ModelsResponse, OpenAIRequestSchema
+  ModelsResponse
 } from "../models/schemas.ts";
-import { debugLog, generateRequestIds, getAuthToken } from "../utils/helpers.ts";
-import { processMessagesWithTools, contentToString } from "../utils/tools.ts";
-import { StreamResponseHandler, NonStreamResponseHandler } from "./response_handlers.ts";
+import { OpenAIRequestSchema } from "../models/schemas.ts";
+import { debugLog, generateRequestIds, getAuthToken, callUpstreamApi } from "../utils/helpers.ts";
+import { processMessagesWithThinking, contentToString } from "../utils/tools.ts";
+import { NonStreamResponseHandler } from "./response_handlers.ts";
 import { getAvailableModels } from "../utils/model_fetcher.ts";
+import { getUpstreamConfig } from "../utils/model_mapper.ts";
 
 export const openaiRouter = new Router();
 
@@ -127,11 +129,12 @@ openaiRouter.post("/chat/completions", async (ctx) => {
     // Generate IDs
     const [chatId, msgId] = generateRequestIds();
     
-    // Process messages with tools
-    const processedMessages = processMessagesWithTools(
+    // Process messages with tools and thinking
+    const processedMessages = processMessagesWithThinking(
       request.messages.map(m => ({ ...m })),
       request.tools,
-      request.tool_choice
+      request.tool_choice,
+      true // 为所有请求启用思考功能
     );
     
     // Convert back to Message objects
@@ -146,33 +149,21 @@ openaiRouter.post("/chat/completions", async (ctx) => {
       });
     }
     
-    // Determine model features
-    const isThinking = request.model === config.THINKING_MODEL;
-    const isSearch = request.model === config.SEARCH_MODEL;
-    const isAir = request.model === config.AIR_MODEL;
-    const isNewThinking = request.model === config.THINKING_MODEL_NEW;
-    const isNewSearch = request.model === config.SEARCH_MODEL_NEW;
-    const searchMcp = isSearch || isNewSearch ? "deep-web-search" : "";
+    // 使用新的模型映射系统获取上游配置
+    const upstreamConfig = getUpstreamConfig(request.model);
     
-    // Determine upstream model ID based on requested model
-    let upstreamModelId: string;
-    let upstreamModelName: string;
-    if (isAir) {
-      upstreamModelId = "0727-106B-API"; // AIR model upstream ID
-      upstreamModelName = "GLM-4.5-Air";
-    } else if (request.model === config.PRIMARY_MODEL_NEW || isNewThinking || isNewSearch) {
-      upstreamModelId = "GLM-4-6-API-V1"; // New GLM-4.6 model upstream ID
-      if (isNewThinking) {
-        upstreamModelName = "GLM-4.6-Thinking";
-      } else if (isNewSearch) {
-        upstreamModelName = "GLM-4.6-Search";
-      } else {
-        upstreamModelName = "GLM-4.6";
-      }
-    } else {
-      upstreamModelId = "0727-360B-API"; // Default upstream model ID
-      upstreamModelName = "GLM-4.5";
+    if (!upstreamConfig) {
+      debugLog(`不支持的模型: ${request.model}`);
+      ctx.response.status = 400;
+      ctx.response.body = { error: `Unsupported model: ${request.model}` };
+      return;
     }
+    
+    const { upstreamModelId, upstreamModelName, features, mcpServers } = upstreamConfig;
+    
+    debugLog(`模型映射: ${request.model} -> ${upstreamModelId} (${upstreamModelName})`);
+    debugLog(`模型特性: ${JSON.stringify(features)}`);
+    debugLog(`MCP服务器: ${JSON.stringify(mcpServers)}`);
     
     // Build upstream request
     const upstreamReq: UpstreamRequest = {
@@ -183,15 +174,15 @@ openaiRouter.post("/chat/completions", async (ctx) => {
       messages: upstreamMessages,
       params: {},
       features: {
-        enable_thinking: isThinking || isNewThinking,
-        web_search: isSearch || isNewSearch,
-        auto_web_search: isSearch || isNewSearch,
+        enable_thinking: true, // 为所有请求都启用思考功能
+        web_search: features.web_search || false,
+        auto_web_search: features.auto_web_search || false,
       },
       background_tasks: {
         title_generation: false,
         tags_generation: false,
       },
-      mcp_servers: searchMcp ? [searchMcp] : [],
+      mcp_servers: mcpServers,
       model_item: {
         id: upstreamModelId,
         name: upstreamModelName,
@@ -216,7 +207,7 @@ openaiRouter.post("/chat/completions", async (ctx) => {
     
     // Handle response based on stream flag
     if (request.stream) {
-      const handler = new StreamResponseHandler(upstreamReq, chatId, authToken, hasTools);
+      debugLog("客户端请求流式响应，直接透传上游流");
       
       // Set SSE headers
       ctx.response.headers.set("Content-Type", "text/event-stream");
@@ -224,33 +215,31 @@ openaiRouter.post("/chat/completions", async (ctx) => {
       ctx.response.headers.set("Connection", "keep-alive");
       ctx.response.headers.set("Access-Control-Allow-Origin", "*");
       
-      // Create a readable stream with better error handling
-      const stream = new ReadableStream({
-        async start(controller) {
-          try {
-            for await (const chunk of handler.handle()) {
-              controller.enqueue(new TextEncoder().encode(chunk));
-            }
-            controller.close();
-          } catch (error) {
-            debugLog(`流式响应处理错误: ${error}`);
-            // 发送错误信息到客户端
-            try {
-              const errorChunk = `data: {"error": {"message": "Stream processing error", "type": "internal_error"}}\n\n`;
-              controller.enqueue(new TextEncoder().encode(errorChunk));
-              controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
-            } catch (controllerError) {
-              debugLog(`控制器错误: ${controllerError}`);
-            }
-            controller.close();
-          }
-        },
-        cancel() {
-          debugLog("客户端取消了流式响应");
+      // Direct stream passthrough - call upstream and pipe response directly
+      try {
+        const upstreamResponse = await callUpstreamApi(upstreamReq, chatId, authToken);
+        
+        if (!upstreamResponse.ok) {
+          debugLog(`上游响应错误: ${upstreamResponse.status}`);
+          ctx.response.status = upstreamResponse.status;
+          ctx.response.body = await upstreamResponse.text();
+          return;
         }
-      });
-      
-      ctx.response.body = stream;
+        
+        // Check if upstream response is actually a stream
+        if (upstreamResponse.body) {
+          debugLog("直接透传上游流式响应");
+          ctx.response.body = upstreamResponse.body;
+        } else {
+          debugLog("上游响应没有body，返回错误");
+          ctx.response.status = 500;
+          ctx.response.body = { error: "Upstream response has no body" };
+        }
+      } catch (error) {
+        debugLog(`调用上游API失败: ${error}`);
+        ctx.response.status = 500;
+        ctx.response.body = { error: `Upstream API call failed: ${error}` };
+      }
     } else {
       try {
         const handler = new NonStreamResponseHandler(upstreamReq, chatId, authToken, hasTools);

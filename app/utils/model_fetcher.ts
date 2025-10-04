@@ -119,41 +119,26 @@ export function getDefaultModels(): ZAIModel[] {
 }
 
 /**
- * 合并默认模型和最新模型
+ * 合并默认模型和最新模型，使用新的模型映射管理器
  */
 export async function getAvailableModels(): Promise<ZAIModel[]> {
-  const defaultModels = getDefaultModels();
+  // 导入模型映射管理器
+  const { modelMappingManager } = await import("./model_mapper.ts");
   
   try {
     const latestModels = await fetchLatestModels();
     
     if (latestModels.length > 0) {
-      // 创建一个 Set 来去重，基于模型 ID
-      const modelMap = new Map<string, ZAIModel>();
-      
-      // 先添加默认模型
-      defaultModels.forEach(model => {
-        modelMap.set(model.id, model);
-      });
-      
-      // 然后添加最新获取的模型，覆盖同名模型
-      latestModels.forEach((model: ZAIModel) => {
-        const modelId = model.id;
-        const modelName = model.name || model.info?.name || modelId;
-        
-        modelMap.set(modelId, {
-          id: modelId,
-          name: modelName,
-          created: model.created || model.info?.created_at || Math.floor(Date.now() / 1000),
-          owned_by: model.owned_by || model.info?.user_id || "z.ai"
-        });
-      });
-      
-      return Array.from(modelMap.values());
+      // 更新动态模型映射
+      modelMappingManager.updateFromZAIModels(latestModels);
     }
+    
+    // 返回所有可用模型（内置 + 动态）
+    return modelMappingManager.mappingsToZAIModels();
   } catch (error) {
-    debugLog(`获取最新模型失败，使用默认模型: ${error}`);
+    debugLog(`获取最新模型失败，使用内置模型: ${error}`);
+    
+    // 回退到内置模型
+    return modelMappingManager.mappingsToZAIModels();
   }
-  
-  return defaultModels;
 }

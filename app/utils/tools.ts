@@ -3,8 +3,30 @@
  */
 
 import { config } from "../core/config.ts";
+import type { Message } from "../models/schemas.ts";
 
-export function contentToString(content: any): string {
+// Tool-related interfaces
+interface ToolFunction {
+  name: string;
+  description?: string;
+  parameters?: {
+    type: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+}
+
+interface Tool {
+  type: string;
+  function?: ToolFunction;
+}
+
+// Additional message types for tool handling
+interface ToolMessage extends Message {
+  name?: string;
+}
+
+export function contentToString(content: unknown): string {
   /**Convert content from various formats to string*/
   if (typeof content === "string") {
     return content;
@@ -23,7 +45,7 @@ export function contentToString(content: any): string {
   return "";
 }
 
-export function generateToolPrompt(tools: any[]): string {
+export function generateToolPrompt(tools: Tool[]): string {
   /**Generate tool injection prompt with enhanced formatting*/
   if (!tools || tools.length === 0) {
     return "";
@@ -35,25 +57,29 @@ export function generateToolPrompt(tools: any[]): string {
       continue;
     }
 
-    const functionSpec = tool.function || {};
+    const functionSpec = tool.function;
+    if (!functionSpec) continue;
+    
     const functionName = functionSpec.name || "unknown";
     const functionDescription = functionSpec.description || "";
-    const parameters = functionSpec.parameters || {};
+    const parameters = functionSpec.parameters;
 
     // Create structured tool definition
     const toolInfo = [`## ${functionName}`, `**Purpose**: ${functionDescription}`];
 
     // Add parameter details
-    const parameterProperties = parameters.properties || {};
-    const requiredParameters = new Set(parameters.required || []);
+    if (parameters && parameters.properties) {
+      const parameterProperties = parameters.properties;
+      const requiredParameters = new Set(parameters.required || []);
 
-    if (Object.keys(parameterProperties).length > 0) {
-      toolInfo.push("**Parameters**:");
-      for (const [paramName, paramDetails] of Object.entries(parameterProperties)) {
-        const paramType = (paramDetails as any)?.type || "any";
-        const paramDesc = (paramDetails as any)?.description || "";
-        const requirementFlag = requiredParameters.has(paramName) ? "**Required**" : "*Optional*";
-        toolInfo.push(`- \`${paramName}\` (${paramType}) - ${requirementFlag}: ${paramDesc}`);
+      if (Object.keys(parameterProperties).length > 0) {
+        toolInfo.push("**Parameters**:");
+        for (const [paramName, paramDetails] of Object.entries(parameterProperties)) {
+          const paramType = (paramDetails as Record<string, unknown>)?.type || "unknown";
+          const paramDesc = (paramDetails as Record<string, unknown>)?.description || "";
+          const requirementFlag = requiredParameters.has(paramName) ? "**Required**" : "*Optional*";
+          toolInfo.push(`- \`${paramName}\` (${paramType}) - ${requirementFlag}: ${paramDesc}`);
+        }
       }
     }
 
@@ -89,16 +115,16 @@ export function generateToolPrompt(tools: any[]): string {
 }
 
 export function processMessagesWithTools(
-  messages: any[],
-  tools?: any[],
-  toolChoice?: any
-): any[] {
+  messages: Message[],
+  tools?: Tool[],
+  toolChoice?: unknown
+): Message[] {
   /**Process messages and inject tool prompts*/
-  const processed: any[] = [];
+  const processed: Message[] = [];
 
   if (tools && config.TOOL_SUPPORT && (toolChoice !== "none")) {
     const toolsPrompt = generateToolPrompt(tools);
-    const hasSystem = messages.some((m: any) => m.role === "system");
+    const hasSystem = messages.some((m: Message) => m.role === "system");
 
     if (hasSystem) {
       for (const m of messages) {
@@ -123,8 +149,10 @@ export function processMessagesWithTools(
         last.content = content + "\n\n请根据需要使用提供的工具函数。";
         processed[processed.length - 1] = last;
       }
-    } else if (typeof toolChoice === "object" && toolChoice?.type === "function") {
-      const fname = toolChoice.function?.name;
+    } else if (typeof toolChoice === "object" && toolChoice && 
+               (toolChoice as Record<string, unknown>).type === "function") {
+      const toolChoiceObj = toolChoice as Record<string, unknown>;
+      const fname = (toolChoiceObj.function as Record<string, unknown>)?.name;
       if (fname && processed.length > 0 && processed[processed.length - 1].role === "user") {
         const last = { ...processed[processed.length - 1] };
         const content = contentToString(last.content || "");
@@ -137,11 +165,11 @@ export function processMessagesWithTools(
   }
 
   // Handle tool/function messages
-  const finalMsgs: any[] = [];
+  const finalMsgs: Message[] = [];
   for (const m of processed) {
     const role = m.role;
     if (role === "tool" || role === "function") {
-      const toolName = m.name || "unknown";
+      const toolName = (m as ToolMessage).name || "unknown";
       let toolContent = contentToString(m.content || "");
       if (typeof toolContent === "object") {
         toolContent = JSON.stringify(toolContent, null, 2);
@@ -173,7 +201,7 @@ export function processMessagesWithTools(
 const TOOL_CALL_FENCE_PATTERN = /```json\s*(\{.*?\})\s*```/gs;
 const FUNCTION_CALL_PATTERN = /调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})/gs;
 
-export function extractToolInvocations(text: string): any[] | null {
+export function extractToolInvocations(text: string): unknown[] | null {
   /**Extract tool invocations from response text*/
   if (!text) {
     return null;
@@ -298,8 +326,7 @@ export function extractToolInvocations(text: string): any[] | null {
 export function removeToolJsonContent(text: string): string {
   /**Remove tool JSON content from response text - using bracket balance method*/
   
-  function removeToolCallBlock(match: RegExpMatchArray): string {
-    const jsonContent = match[1];
+  function removeToolCallBlock(match: string, jsonContent: string): string {
     try {
       const parsedData = JSON.parse(jsonContent);
       if ("tool_calls" in parsedData) {
@@ -308,11 +335,11 @@ export function removeToolJsonContent(text: string): string {
     } catch {
       // 忽略解析错误
     }
-    return match[0];
+    return match;
   }
   
   // Step 1: Remove fenced tool JSON blocks
-  let cleanedText = text.replace(TOOL_CALL_FENCE_PATTERN, removeToolCallBlock);
+  const cleanedText = text.replace(TOOL_CALL_FENCE_PATTERN, removeToolCallBlock);
   
   // Step 2: Remove inline tool JSON - 使用基于括号平衡的智能方法
   // 查找所有可能的 JSON 对象并精确删除包含 tool_calls 的对象
@@ -368,4 +395,69 @@ export function removeToolJsonContent(text: string): string {
   }
   
   return result.join('').trim();
+}
+
+/**
+ * 为消息添加思考提示，启用模型的思考能力
+ */
+export function addThinkingPromptToMessages(messages: Message[]): Message[] {
+  const processedMessages = [...messages];
+  
+  // 思考指令模板
+  const thinkingInstruction = `
+
+在回答之前，请在 <thinking> 标签中进行思考分析：
+- 仔细分析用户的问题和需求
+- 考虑可能的解决方案和方法
+- 评估答案的准确性和完整性
+- 组织回答的结构和逻辑
+
+然后给出你的最终回答。请确保你的思考过程清晰且有条理。`;
+
+  // 查找系统消息或创建一个新的
+  let hasSystemMessage = false;
+  for (let i = 0; i < processedMessages.length; i++) {
+    if (processedMessages[i].role === "system") {
+      hasSystemMessage = true;
+      const existingContent = contentToString(processedMessages[i].content || "");
+      // 检查是否已经包含思考指令
+      if (!existingContent.includes("<thinking>")) {
+        processedMessages[i] = {
+          ...processedMessages[i],
+          content: existingContent + thinkingInstruction
+        };
+      }
+      break;
+    }
+  }
+  
+  // 如果没有系统消息，创建一个新的
+  if (!hasSystemMessage) {
+    processedMessages.unshift({
+      role: "system",
+      content: "你是一个有用的AI助手。" + thinkingInstruction
+    });
+  }
+  
+  return processedMessages;
+}
+
+/**
+ * 为所有请求启用思考功能的消息处理器
+ */
+export function processMessagesWithThinking(
+  messages: Message[],
+  tools?: unknown[],
+  toolChoice?: unknown,
+  enableThinking = true
+): Message[] {
+  // 首先处理工具相关的消息
+  let processedMessages = processMessagesWithTools(messages, tools as Tool[], toolChoice);
+  
+  // 如果启用思考功能，添加思考提示
+  if (enableThinking) {
+    processedMessages = addThinkingPromptToMessages(processedMessages);
+  }
+  
+  return processedMessages;
 }

@@ -3,11 +3,11 @@
  */
 
 import { config } from "./config.ts";
-import { 
+import type { 
   Delta, OpenAIResponse, 
-  UpstreamRequest, UpstreamData, UpstreamError,
-  UpstreamDataSchema
+  UpstreamRequest, UpstreamData, UpstreamError
 } from "../models/schemas.ts";
+import { UpstreamDataSchema } from "../models/schemas.ts";
 import { debugLog, callUpstreamApi, transformThinkingContent } from "../utils/helpers.ts";
 import { SSEParser } from "../utils/sse_parser.ts";
 import { extractToolInvocations, removeToolJsonContent } from "../utils/tools.ts";
