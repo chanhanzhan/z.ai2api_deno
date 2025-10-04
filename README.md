@@ -32,7 +32,7 @@
 
 Deno Deploy是一个全球分布式的边缘计算平台，非常适合部署Deno应用。
 
-[![Deploy on Deno Deploy](https://deno.com/deploy/button.svg)](https://dash.deno.com/new?repository=https://github.com/chanhanzhan/z.ai2api_deno/)
+[![Deploy on Deno Deploy](https://deno.com/deploy.svg)](https://dash.deno.com/new?repository=https://github.com/chanhanzhan/z.ai2api_deno/)
 #### 步骤：
 
 1. **准备代码**
